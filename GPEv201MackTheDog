@@ -1,0 +1,757 @@
+#!/usr/bin/env python3
+# Griffin Grinder Pro - Integrated Drop Zone, Caching Note Handler & Shred Gate
+# - Retains version 2.0.1 Drop Box note handling (caches text alongside dropped files).
+# - Uses pure ChaCha20Poly1305 + Zlib stream architecture with no Base64 transport layer.
+# - Includes "Fast" and "Normal" security profiles exclusively.
+# - Fixes the UI layout issue by anchoring the bottom button frame so it never clips out of view.
+# - Fully resolved the password masking synchronization bugs across layout switches.
+
+import customtkinter as ctk
+from tkinter import messagebox, filedialog, Menu
+from tkinterdnd2 import TkinterDnD, DND_FILES
+import argon2
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
+from cryptography.exceptions import InvalidTag
+import os
+import threading
+import queue
+from datetime import datetime
+import json
+import zlib
+import gc
+from typing import List, Optional, Generator, Tuple
+import urllib.parse
+import math
+
+# Configure clean parameters
+ctk.set_appearance_mode("Light")  
+ctk.set_default_color_theme("blue")
+
+# -----------------------------------------------------------------------------
+# -- CRYPTO SERVICE CLASS (PURE BINARY PAYLOAD + CHACHA20POLY1305)
+# -----------------------------------------------------------------------------
+class CryptoService:
+    CHUNK_SIZE = 16 * 1024 * 1024  # 16MB raw chunks
+    PADDING_BLOCK_SIZE = 16384     # 16KB side-channel mitigation alignment
+    KEY_BYTES = 32
+    SALT_BYTES = 32
+    NONCE_BYTES = 12
+
+    def _zero_bytearray(self, b: bytearray) -> None:
+        """Overwrites volatile memory blocks directly."""
+        if b:
+            for i in range(len(b)):
+                b[i] = 0
+        gc.collect()
+
+    def generate_master_key(self, password_str: str, salt: bytes, level: str) -> bytearray:
+        """Derives Argon2id master key mapped to strict standard memory boundaries."""
+        if level == "Fast":
+            time_cost, memory_cost, parallelism = 2, 256 * 1024, 2      # 256MB
+        else: 
+            time_cost, memory_cost, parallelism = 3, 512 * 1024, 2      # 512MB (Normal)
+           
+        raw_pwd = bytearray(password_str.encode('utf-8'))
+        try:
+            raw_key = argon2.low_level.hash_secret_raw(
+                secret=bytes(raw_pwd), salt=salt, 
+                time_cost=time_cost,
+                memory_cost=memory_cost, parallelism=parallelism,
+                hash_len=self.KEY_BYTES, type=argon2.low_level.Type.ID
+            )
+            return bytearray(raw_key)
+        finally:
+            if isinstance(raw_pwd, bytearray):
+                self._zero_bytearray(raw_pwd)
+
+    def derive_ephemeral_key(self, master_key: bytearray, info_str: str) -> bytearray:
+        hkdf = HKDF(
+            algorithm=hashes.SHA256(),
+            length=self.KEY_BYTES,
+            salt=None,
+            info=info_str.encode('utf-8')
+        )
+        derived = hkdf.derive(bytes(master_key))
+        return bytearray(derived)
+
+    def secure_shred_file(self, filepath: str):
+        """Executes a defensive 1-pass random overwrite to destroy file patterns."""
+        try:
+            if os.path.isfile(filepath):
+                file_size = os.path.getsize(filepath)
+                if file_size > 0:
+                    with open(filepath, "r+b") as f:
+                        f.seek(0)
+                        bytes_left = file_size
+                        while bytes_left > 0:
+                            chunk_to_write = min(bytes_left, self.CHUNK_SIZE)
+                            f.write(os.urandom(chunk_to_write))
+                            bytes_left -= chunk_to_write
+                        f.flush()
+                        os.fsync(f.fileno())
+                
+                with open(filepath, "wb") as f:
+                    pass
+                os.remove(filepath)
+        except Exception:
+            pass 
+
+    def encrypt_paths(self, password: str, input_paths: List[str], level: str, shred_source: bool = False, secure_note: str = "") -> Generator[Tuple[int, int], None, str]:
+        desktop_path = os.path.join(os.path.expanduser('~'), 'Desktop')
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        output_filename = f"secure_package_{timestamp}.grn"
+        final_output_path = os.path.join(desktop_path, output_filename)
+        
+        file_list = list(self._get_all_filepaths(input_paths))
+        total_unencrypted_size = sum(os.path.getsize(fp) for fp, _ in file_list)
+        
+        note_bytes = b""
+        if secure_note:
+            note_bytes = secure_note.encode('utf-8')
+            total_unencrypted_size += len(note_bytes)
+            
+        processed_size = 0
+        salt = os.urandom(self.SALT_BYTES)
+        master_key = self.generate_master_key(password, salt, level)
+        
+        try:
+            fat_entries = []
+            
+            with open(final_output_path, 'wb') as f_out:
+                f_out.write(salt)
+                
+                # Encrypt allocated files
+                for index, (full_path, relative_path) in enumerate(file_list):
+                    yield processed_size, total_unencrypted_size
+                    file_key = self.derive_ephemeral_key(master_key, f"file_payload_{index}")
+                    
+                    payload_start_offset = f_out.tell()
+                    real_size = os.path.getsize(full_path)
+                    
+                    chunks_meta = []
+                    chacha = ChaCha20Poly1305(bytes(file_key))
+                    
+                    with open(full_path, 'rb') as f_in:
+                        while True:
+                            raw_chunk = f_in.read(self.CHUNK_SIZE)
+                            if not raw_chunk:
+                                break
+                            
+                            compressed_chunk = zlib.compress(raw_chunk, level=6)
+                            comp_len = len(compressed_chunk)
+                            
+                            payload_to_pad = comp_len.to_bytes(4, 'big') + compressed_chunk
+                            
+                            pad_mod = len(payload_to_pad) % self.PADDING_BLOCK_SIZE
+                            pad_needed = (self.PADDING_BLOCK_SIZE - pad_mod) % self.PADDING_BLOCK_SIZE
+                            padded_chunk = payload_to_pad + os.urandom(pad_needed)
+                            
+                            nonce = os.urandom(self.NONCE_BYTES)
+                            encrypted_chunk = chacha.encrypt(nonce, padded_chunk, None)
+                            
+                            chunks_meta.append({
+                                'nonce_hex': nonce.hex(),
+                                'size': len(encrypted_chunk)
+                            })
+                            
+                            f_out.write(encrypted_chunk)
+                            yield processed_size + len(raw_chunk), total_unencrypted_size
+                    
+                    fat_entries.append({
+                        'filename': relative_path,
+                        'real_size': real_size,
+                        'payload_offset': payload_start_offset,
+                        'chunks': chunks_meta,
+                        'is_virtual': False
+                    })
+                    
+                    processed_size += real_size
+                    self._zero_bytearray(file_key)
+                
+                # Append inline typed Drop Box text as README.txt
+                if note_bytes:
+                    yield processed_size, total_unencrypted_size
+                    v_index = len(file_list)
+                    note_real_size = len(note_bytes)
+                    
+                    note_key = self.derive_ephemeral_key(master_key, f"file_payload_{v_index}")
+                    note_payload_offset = f_out.tell()
+                    
+                    chacha_v = ChaCha20Poly1305(bytes(note_key))
+                    comp_note = zlib.compress(note_bytes, level=6)
+                    comp_v_len = len(comp_note)
+                    
+                    v_payload_to_pad = comp_v_len.to_bytes(4, 'big') + comp_note
+                    v_pad_mod = len(v_payload_to_pad) % self.PADDING_BLOCK_SIZE
+                    v_pad_needed = (self.PADDING_BLOCK_SIZE - v_pad_mod) % self.PADDING_BLOCK_SIZE
+                    padded_v_chunk = v_payload_to_pad + os.urandom(v_pad_needed)
+                    
+                    v_nonce = os.urandom(self.NONCE_BYTES)
+                    encrypted_v_chunk = chacha_v.encrypt(v_nonce, padded_v_chunk, None)
+                    
+                    fat_entries.append({
+                        'filename': "README.txt",
+                        'real_size': note_real_size,
+                        'payload_offset': note_payload_offset,
+                        'chunks': [{
+                            'nonce_hex': v_nonce.hex(),
+                            'size': len(encrypted_v_chunk)
+                        }],
+                        'is_virtual': True
+                    })
+                    f_out.write(encrypted_v_chunk)
+                    processed_size += note_real_size
+                    self._zero_bytearray(note_key)
+
+                # Append encrypted FAT architecture structure map
+                fat_bytes = json.dumps(fat_entries).encode('utf-8')
+                fat_key = self.derive_ephemeral_key(master_key, "fat_header_encryption")
+                
+                chacha_fat = ChaCha20Poly1305(bytes(fat_key))
+                fat_nonce = os.urandom(self.NONCE_BYTES)
+                encrypted_fat = chacha_fat.encrypt(fat_nonce, fat_bytes, None)
+                self._zero_bytearray(fat_key)
+                
+                fat_base_pointer = f_out.tell()
+                f_out.write(fat_nonce)
+                f_out.write(encrypted_fat)
+                f_out.write(fat_base_pointer.to_bytes(8, 'big'))
+            
+            if shred_source:
+                for full_path, _ in file_list:
+                    self.secure_shred_file(full_path)
+                 
+            yield total_unencrypted_size, total_unencrypted_size
+            return final_output_path
+          
+        finally:
+            self._zero_bytearray(master_key)
+
+    def decrypt_archive(self, password: str, input_path: str, output_directory: str, level: str) -> Generator[Tuple[int, int], None, str]:
+        with open(input_path, 'rb') as f_in:
+            salt = f_in.read(self.SALT_BYTES)
+            master_key = self.generate_master_key(password, salt, level)
+            
+            try:
+                f_in.seek(-8, os.SEEK_END)
+                fat_base_pointer = int.from_bytes(f_in.read(8), 'big')
+                
+                f_in.seek(fat_base_pointer)
+                fat_nonce = f_in.read(self.NONCE_BYTES)
+                encrypted_fat = f_in.read()[:-8]
+                
+                fat_key = self.derive_ephemeral_key(master_key, "fat_header_encryption")
+                chacha_fat = ChaCha20Poly1305(bytes(fat_key))
+                
+                fat_json = chacha_fat.decrypt(fat_nonce, encrypted_fat, None)
+                fat_entries = json.loads(fat_json)
+                self._zero_bytearray(fat_key)
+                
+                processed_bytes = 0
+                total_target_payload_bytes = sum(entry['real_size'] for entry in fat_entries)
+                yield 0, total_target_payload_bytes
+
+                for index, entry in enumerate(fat_entries):
+                    relative_filename = entry['filename']
+                    payload_offset = entry['payload_offset']
+                    chunks = entry['chunks']
+                    
+                    clean_rel_path = relative_filename.replace("/", os.sep)
+                    output_filepath = os.path.normpath(os.path.join(output_directory, clean_rel_path))
+                    base_target_path = os.path.abspath(output_directory)
+                   
+                    if not os.path.abspath(output_filepath).startswith(base_target_path):
+                        raise PermissionError(f"Directory traversal compromise caught: {relative_filename}")
+                        
+                    if os.path.exists(output_filepath):
+                        dir_part = os.path.dirname(output_filepath)
+                        name_part, extension_part = os.path.splitext(os.path.basename(output_filepath))
+                        counter = 1
+                        while os.path.exists(output_filepath):
+                            unique_name = f"{name_part} ({counter}){extension_part}"
+                            output_filepath = os.path.join(dir_part, unique_name)
+                            counter += 1
+
+                    os.makedirs(os.path.dirname(output_filepath), exist_ok=True)
+                    f_in.seek(payload_offset)
+                    
+                    file_key = self.derive_ephemeral_key(master_key, f"file_payload_{index}")
+                    chacha = ChaCha20Poly1305(bytes(file_key))
+                    
+                    with open(output_filepath, 'wb') as f_out:
+                        for chunk in chunks:
+                            nonce = bytes.fromhex(chunk['nonce_hex'])
+                            enc_size = chunk['size']
+                            
+                            encrypted_data = f_in.read(enc_size)
+                            decrypted_padded = chacha.decrypt(nonce, encrypted_data, None)
+                            
+                            comp_len = int.from_bytes(decrypted_padded[:4], 'big')
+                            compressed_chunk = decrypted_padded[4:4+comp_len]
+                            
+                            raw_data = zlib.decompress(compressed_chunk)
+                            f_out.write(raw_data)
+                            
+                            processed_bytes += len(raw_data)
+                            yield min(processed_bytes, total_target_payload_bytes), total_target_payload_bytes
+                            
+                    self._zero_bytearray(file_key)
+            finally:
+                self._zero_bytearray(master_key)
+                
+        return output_directory
+
+    @staticmethod
+    def _get_all_filepaths(paths: List[str]) -> Generator[Tuple[str, str], None, None]:
+        for path in paths:
+            if os.path.isfile(path):
+                yield path, os.path.basename(path)
+            elif os.path.isdir(path):
+                root_dir = os.path.dirname(path)
+                for base_dir, _, filenames in os.walk(path):
+                    for filename in filenames:
+                        full_path = os.path.join(base_dir, filename)
+                        relative_path = os.path.relpath(full_path, root_dir)
+                        unified_path = relative_path.replace(os.sep, "/")
+                        yield full_path, unified_path
+
+
+# -----------------------------------------------------------------------------
+# -- PUBLIC INTERFACE (INTEGRATED FLUID NOTE CACHING + ANCHORED BOTTOM LAYOUT)
+# -----------------------------------------------------------------------------
+class ModernEncryptionApp:
+    def __init__(self, root: TkinterDnD.Tk):
+        self.root = root
+        self.crypto_service = CryptoService()
+        
+        self.root.title("Griffin Grinder Pro")
+        self.root.geometry("620x760")
+        self.root.minsize(580, 700)
+        
+        self.input_paths: List[str] = []
+        self.progress_queue = queue.Queue()
+        self.shred_validated = False  
+        self.passwords_visible = False # Starts explicitly masked
+        self.pulse_step = 0
+        
+        self._initialize_system_menus()
+        
+        # Main Frame setup
+        self.main_frame = ctk.CTkFrame(master=self.root, corner_radius=16, fg_color="#f5f6f8")
+        self.main_frame.pack(expand=True, fill="both", padx=20, pady=20)
+        
+        # -----------------------------------------------------------------------------
+        # 1. ANCHOR THE BOTTOM CONTROL ELEMENTS FIRST (Ensures they never push out of view)
+        # -----------------------------------------------------------------------------
+        self.button_container = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        self.button_container.pack(side="bottom", fill="x", padx=30, pady=(0, 20))
+        
+        self.clear_button = ctk.CTkButton(self.button_container, text="Clear Layout", fg_color="#e2e8f0", hover_color="#cbd5e1", text_color="#475569", font=ctk.CTkFont(weight="bold"), command=self.clear_fields, width=120)
+        self.clear_button.pack(side="left")
+        
+        self.process_button = ctk.CTkButton(self.button_container, text="Lock Package", font=ctk.CTkFont(weight="bold"), command=self.process, width=150)
+        self.process_button.pack(side="right")
+        
+        self.progress_bar = ctk.CTkProgressBar(self.main_frame, orientation="horizontal", height=8, progress_color="#2ecc71")
+        self.progress_bar.set(0)
+        self.progress_bar.pack(side="bottom", fill="x", padx=30, pady=(2, 15))
+
+        self.progress_label = ctk.CTkLabel(self.main_frame, text="Status: Ready for input", font=ctk.CTkFont(size=12), text_color="#7f8c8d")
+        self.progress_label.pack(side="bottom", anchor="w", padx=35)
+
+        # -----------------------------------------------------------------------------
+        # 2. RENDER THE TOP MANAGEMENT ASSETS
+        # -----------------------------------------------------------------------------
+        self.title_label = ctk.CTkLabel(self.main_frame, text="🛡️ GRIFFIN GRINDER PRO", font=ctk.CTkFont(size=20, weight="bold"), text_color="#2c3e50")
+        self.title_label.pack(side="top", pady=(25, 12))
+
+        self.current_layout_mode = "Encrypt"
+        self.mode_var = ctk.StringVar(value="Encrypt")
+        self.mode_selector = ctk.CTkSegmentedButton(self.main_frame, values=["Encrypt", "Decrypt"], 
+                                                    command=self.handle_mode_switch, variable=self.mode_var,
+                                                    font=ctk.CTkFont(size=13, weight="bold"))
+        self.mode_selector.pack(side="top", fill="x", padx=30, pady=(0, 15))
+         
+        # PASSWORD CONTAINER WITH INTEGRATED VISIBILITY BUTTON
+        self.pass_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        self.pass_frame.pack(side="top", fill="x", padx=30, pady=2)
+        
+        self.p1_row_wrapper = ctk.CTkFrame(self.pass_frame, fg_color="transparent")
+        self.p1_row_wrapper.pack(fill="x", pady=(0, 4))
+        
+        self.password_entry = ctk.CTkEntry(self.p1_row_wrapper, placeholder_text="Enter Master Password", show="*", height=42, fg_color="#ffffff", text_color="#1a1a1a", border_color="#dcdde1")
+        self.password_entry.pack(side="left", expand=True, fill="x")
+        self.password_entry.bind("<KeyRelease>", self._validate_passwords)
+        
+        self.view_password_btn = ctk.CTkButton(self.p1_row_wrapper, text="👁️", width=44, height=42, fg_color="#e2e8f0", hover_color="#cbd5e1", text_color="#475569", font=ctk.CTkFont(size=14), command=self.toggle_password_visibility)
+        self.view_password_btn.pack(side="right", padx=(6, 0))
+        
+        self.confirm_entry = ctk.CTkEntry(self.pass_frame, placeholder_text="Confirm Master Password", show="*", height=42, fg_color="#ffffff", text_color="#1a1a1a", border_color="#dcdde1")
+        self.confirm_entry.pack(fill="x", pady=4)
+        self.confirm_entry.bind("<KeyRelease>", self._validate_passwords)
+        
+        self.status_feedback_label = ctk.CTkLabel(self.pass_frame, text="", font=ctk.CTkFont(size=13, weight="bold"))
+        self.status_feedback_label.pack(anchor="w", padx=5, pady=1)
+        
+        self.config_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        self.config_frame.pack(side="top", fill="x", padx=30, pady=(2, 6))
+        
+        self.level_label = ctk.CTkLabel(self.config_frame, text="Security Profile:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#57606f")
+        self.level_label.pack(side="left", padx=(5, 10))
+        
+        self.security_level = ctk.CTkComboBox(self.config_frame, values=["Fast", "Normal"], width=110, fg_color="#ffffff", text_color="#1a1a1a", border_color="#dcdde1")
+        self.security_level.set("Normal")
+        self.security_level.pack(side="left")
+
+        self.shred_checkbox_var = ctk.BooleanVar(value=False)
+        self.shred_checkbox = ctk.CTkCheckBox(self.config_frame, text="Shred Originals", variable=self.shred_checkbox_var, 
+                                              command=self.handle_shred_toggle, font=ctk.CTkFont(size=12, weight="bold"),
+                                              text_color="#2c3e50", border_color="#718093", hover_color="#eb4d4b")
+        self.shred_checkbox.pack(side="right", padx=(10, 5))
+        
+        # INLINE WARNING INTERFACE
+        self.inline_warning_frame = ctk.CTkFrame(self.main_frame, corner_radius=10, fg_color="#fff9e6", border_width=2, border_color="#2563eb")
+        
+        warning_msg = ("⚠️ PERMANENT FILE DESTRUCTION WARNING:\n"
+                       "If enabled, original source files will be completely erased and permanently "
+                       "deleted immediately after successful encryption.\n"
+                       "This bypasses the Recycle Bin. To unlock execution, type 'SHRED' below:")
+        
+        self.inline_warning_label = ctk.CTkLabel(self.inline_warning_frame, text=warning_msg, text_color="#b78103",
+                                                 font=ctk.CTkFont(size=12, weight="bold"), justify="left", wraplength=480)
+        self.inline_warning_label.pack(pady=(12, 6), padx=15, fill="x")
+        
+        self.inline_verify_entry = ctk.CTkEntry(self.inline_warning_frame, placeholder_text="Type SHRED to verify", width=200, fg_color="#ffffff", text_color="#1a1a1a", border_color="#ffe0b2")
+        self.inline_verify_entry.pack(pady=(0, 12))
+        self.inline_verify_entry.bind("<KeyRelease>", self._validate_inline_shred_text)
+
+        # ADAPTIVE DROP ZONE WINDOW (Takes up remaining vertical space smoothly)
+        self.drop_zone = ctk.CTkTextbox(self.main_frame, corner_radius=12, border_width=4, border_color="#cccccc",
+                                        font=ctk.CTkFont(size=13), fg_color="#ffffff", text_color="#2f3640", wrap="word")
+        self.drop_zone.pack(expand=True, fill="both", padx=30, pady=(5, 10))
+         
+        self.drop_zone.drop_target_register(DND_FILES)
+        self.drop_zone.dnd_bind('<<Drop>>', self.handle_drop)
+        self.drop_zone.dnd_bind('<<DragEnter>>', lambda e: self.drop_zone.configure(state="disabled"))
+        self.drop_zone.dnd_bind('<<DragLeave>>', lambda e: self.drop_zone.configure(state="disabled" if self.mode_var.get() == "Decrypt" else "normal"))
+        
+        self.drop_zone.bind("<FocusIn>", self._handle_textbox_focus)
+        self.drop_zone_has_custom_text = False
+        
+        self.update_display_text()
+        self.check_queue()
+        self._animate_pulsing_border() 
+
+    def toggle_password_visibility(self):
+        """Switches between masked and clear text presentation formats."""
+        self.passwords_visible = not self.passwords_visible
+        mask_value = "" if self.passwords_visible else "*"
+        button_icon = "🙈" if self.passwords_visible else "👁️"
+        
+        self.password_entry.configure(show=mask_value)
+        self.confirm_entry.configure(show=mask_value)
+        self.view_password_btn.configure(text=button_icon)
+
+    def _animate_pulsing_border(self):
+        if not self.input_paths and not self.drop_zone_has_custom_text:
+            self.pulse_step += 0.20  
+            factor = (math.sin(self.pulse_step) + 1) / 2
+            r = int(164 + (0 - 164) * factor)
+            g = int(176 + (168 - 176) * factor)
+            b = int(190 + (255 - 190) * factor)
+            hex_color = f"#{r:02x}{g:02x}{b:02x}"
+            self.drop_zone.configure(border_width=4, border_color=hex_color)
+        self.root.after(60, self._animate_pulsing_border)
+
+    def _initialize_system_menus(self):
+        menu_bar = Menu(self.root)
+        file_menu = Menu(menu_bar, tearoff=0)
+        file_menu.add_command(label="Clear Session Layout", command=self.clear_fields)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.root.quit)
+        menu_bar.add_cascade(label="File", menu=file_menu)
+        
+        help_menu = Menu(menu_bar, tearoff=0)
+        help_menu.add_command(label="Security Specifications", command=self.show_security_specs)
+        help_menu.add_command(label="About Engine", command=self.show_about_popup)
+        menu_bar.add_cascade(label="Help", menu=help_menu)
+        self.root.config(menu=menu_bar)
+
+    def show_about_popup(self):
+        messagebox.showinfo("About", "Griffin Grinder Pro\nv1.8.0-FixedUI\nIntegrated Local Binary Release.")
+
+    def show_security_specs(self):
+        messagebox.showinfo("Specs", "Argon2id + ChaCha20-Poly1305 Raw Binary Payload Operations.")
+
+    def handle_shred_toggle(self):
+        """Packs warning pane inline. The Drop Zone text box shrinks to adapt automatically."""
+        if self.shred_checkbox_var.get():
+            self.inline_warning_frame.pack(after=self.config_frame, fill="x", padx=30, pady=(0, 10))
+            self.inline_verify_entry.delete(0, 'end')
+            self.inline_verify_entry.focus()
+            self.shred_validated = False
+            self.progress_label.configure(text="Status: Safety phrase confirmation required.", text_color="#b78103")
+        else:
+            self.inline_warning_frame.pack_forget()
+            self.shred_validated = False
+            self.progress_label.configure(text="Status: Shredding routine de-allocated.", text_color="#7f8c8d")
+        self._validate_passwords()
+
+    def _validate_inline_shred_text(self, event=None):
+        if self.inline_verify_entry.get().strip() == "SHRED":
+            self.shred_validated = True
+            self.progress_label.configure(text="Status: Shred authorized.", text_color="#2ecc71")
+        else:
+            self.shred_validated = False
+            self.progress_label.configure(text="Status: Safety phrase mismatch.", text_color="#eb4d4b")
+        self._validate_passwords()
+
+    def handle_mode_switch(self, selected_mode: str, force_clear: bool = True):
+        if force_clear:
+            self.input_paths.clear()
+            self.password_entry.delete(0, 'end')
+            self.confirm_entry.delete(0, 'end')
+            self.drop_zone_has_custom_text = False
+     
+        self.current_layout_mode = selected_mode
+        self.mode_var.set(selected_mode)
+
+        # Explicitly enforce current masked view property on target items across switches
+        current_mask_char = "" if self.passwords_visible else "*"
+
+        if selected_mode == "Decrypt":
+            self.confirm_entry.pack_forget()
+            self.shred_checkbox.pack_forget()
+            self.inline_warning_frame.pack_forget()
+            self.process_button.configure(text="Unlock & Extract", fg_color="#3b82f6", hover_color="#2563eb")
+        else:
+            self.confirm_entry.pack(after=self.p1_row_wrapper, fill="x", pady=4)
+            self.shred_checkbox.pack(side="right", padx=(10, 5))
+            if self.shred_checkbox_var.get():
+                self.inline_warning_frame.pack(after=self.config_frame, fill="x", padx=30, pady=(0, 10))
+            self.process_button.configure(text="Lock Package", fg_color="#10b981", hover_color="#059669")
+        
+        # Enforce character configuration settings explicitly
+        self.password_entry.configure(show=current_mask_char)
+        self.confirm_entry.configure(show=current_mask_char)
+        
+        if force_clear:
+            self.update_display_text()
+        self._validate_passwords()
+
+    def _validate_passwords(self, event=None) -> bool:
+        mode = self.mode_var.get()
+        p1 = self.password_entry.get()
+        p2 = self.confirm_entry.get()
+        
+        if len(p1) < 8:
+            self.status_feedback_label.configure(text="⚠️ Password must be at least 8 characters.", text_color="#eb4d4b")
+            self.process_button.configure(state="disabled")
+            return False
+             
+        if mode == "Encrypt":
+            if p1 != p2:
+                self.status_feedback_label.configure(text="❌ Passwords do not match.", text_color="#eb4d4b")
+                self.process_button.configure(state="disabled")
+                return False
+            if self.shred_checkbox_var.get() and not self.shred_validated:
+                self.status_feedback_label.configure(text="⚠️ Security verification required below.", text_color="#b78103")
+                self.process_button.configure(state="disabled")
+                return False
+            self.status_feedback_label.configure(text="✨ Verification success: Setup ready.", text_color="#10b981")
+            self.process_button.configure(state="normal")
+            return True
+        else:
+            self.status_feedback_label.configure(text="🔒 Ready to decode matching archive context.", text_color="#3b82f6")
+            self.process_button.configure(state="normal")
+            return True
+
+    def _handle_textbox_focus(self, event):
+        if self.mode_var.get() == "Encrypt" and not self.drop_zone_has_custom_text:
+            self.drop_zone.configure(state="normal")
+            current_content = self.drop_zone.get("1.0", "end")
+            marker = "[Click anywhere here to type an optional message to the receiver]"
+            if marker in current_content:
+                base_text = current_content.split(marker)[0]
+                self.drop_zone.delete("1.0", "end")
+                self.drop_zone.insert("1.0", base_text + "\n📝 Message to Receiver:\n")
+            self.drop_zone_has_custom_text = True
+
+    def handle_drop(self, event):
+        try:
+            raw_dropped_items = self.root.tk.splitlist(event.data)
+            dropped_items = []
+            
+            for path in raw_dropped_items:
+                path = path.strip()
+                if path.startswith("file://"):
+                    path = urllib.parse.unquote(path[7:])
+                if os.path.exists(path):
+                    dropped_items.append(path)
+
+            if not dropped_items:
+                return
+                
+            is_package_file = len(dropped_items) == 1 and dropped_items[0].endswith('.grn')
+            
+            if is_package_file:
+                self.input_paths = dropped_items
+                self.handle_mode_switch("Decrypt", force_clear=False)
+                self.drop_zone.configure(border_width=4, border_color="#3b82f6")
+                self.update_display_text()
+            else:
+                for p in dropped_items:
+                    if p not in self.input_paths and not p.endswith('.grn'):
+                        self.input_paths.append(p)
+                self.handle_mode_switch("Encrypt", force_clear=False)
+                self.drop_zone.configure(border_width=4, border_color="#10b981")
+                self.update_display_text()
+                 
+            self._validate_passwords()
+        except Exception as e:
+            messagebox.showerror("Drop Error", f"Could not register item mapping: {e}")
+            self.clear_fields()
+
+    def update_display_text(self):
+        self.drop_zone.configure(state="normal")
+        
+        user_typed_msg = ""
+        if self.drop_zone_has_custom_text:
+            raw_content = self.drop_zone.get("1.0", "end")
+            if "\n📝 Message to Receiver:\n" in raw_content:
+                user_typed_msg = raw_content.split("\n📝 Message to Receiver:\n")[1].strip()
+
+        self.drop_zone.delete("1.0", "end")
+        
+        if not self.input_paths:
+            display_text = "\n\n\t\t📥 Secure Drop Zone\n\n\t\tDrag and drop folders or files here to begin...\n\t\tOptional: Type a message here to append a README.txt!"
+            self.drop_zone_has_custom_text = False
+            self.drop_zone.insert("1.0", display_text)
+        elif self.mode_var.get() == "Decrypt":
+            display_text = f"\n📦 ARMORED PACKAGE ACTIVE FOR EXTRACTION:\n\n- {os.path.basename(self.input_paths[0])}"
+            self.drop_zone.insert("1.0", display_text)
+            self.drop_zone.configure(state="disabled")
+        else:
+            display_text = f"📂 PENDING FILES ALLOCATED FOR SECURING ({len(self.input_paths)} items):\n"
+            for p in self.input_paths:
+                display_text += f"- {os.path.basename(p)}\n"
+            
+            if not self.drop_zone_has_custom_text:
+                display_text += "\n[Click anywhere here to type an optional message to the receiver]\n"
+            else:
+                display_text += "\n📝 Message to Receiver:\n"
+                
+            self.drop_zone.insert("1.0", display_text)
+            if user_typed_msg:
+                self.drop_zone.insert("end", user_typed_msg)
+
+    def clear_fields(self):
+        self.input_paths.clear()
+        self.password_entry.delete(0, 'end')
+        self.confirm_entry.delete(0, 'end')
+        self.shred_checkbox_var.set(False)
+        self.inline_warning_frame.pack_forget()
+        self.shred_validated = False
+        self.drop_zone_has_custom_text = False
+        self.passwords_visible = False # Re-mask on clean slate wipe
+        self.view_password_btn.configure(text="👁️")
+        self.handle_mode_switch("Encrypt", force_clear=True)
+        self.progress_bar.set(0)
+        self.progress_label.configure(text="Status: Cleaned Session.", text_color="#7f8c8d")
+        self._validate_passwords()
+        gc.collect()
+
+    def check_queue(self):
+        try:
+            while True:
+                message = self.progress_queue.get_nowait()
+                if isinstance(message, tuple):
+                    processed, total = message
+                    ratio = (processed / total) if total > 0 else 0
+                    self.progress_bar.set(ratio)
+                    self.progress_label.configure(text=f"Processing Payload Stream... {int(ratio * 100)}%")
+                elif isinstance(message, str):
+                    self.progress_label.configure(text=message)
+        except queue.Empty:
+            pass
+        finally:
+            self.root.after(100, self.check_queue)
+
+    def process(self):
+        if not self._validate_passwords():
+            return
+            
+        password = self.password_entry.get()
+        mode = self.mode_var.get()
+        level = self.security_level.get()
+        shred = self.shred_checkbox_var.get() and self.shred_validated
+        
+        msg_content = ""
+        if mode == "Encrypt":
+            raw_text = self.drop_zone.get("1.0", "end")
+            if self.drop_zone_has_custom_text and "\n📝 Message to Receiver:\n" in raw_text:
+                extracted_message = raw_text.split("\n📝 Message to Receiver:\n")[1].strip()
+                if extracted_message:
+                    msg_content = extracted_message
+
+        if mode == "Encrypt" and not self.input_paths and not msg_content:
+            messagebox.showwarning("Empty Submission", "Please drop target files or write a secure message text before execution.")
+            return
+
+        self.process_button.configure(state="disabled", text="Working...")
+        self.progress_bar.set(0)
+        
+        default_desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
+        
+        if mode == "Decrypt":
+            output_dir_parent = filedialog.askdirectory(title="Select Destination Extract Root", initialdir=default_desktop)
+            if not output_dir_parent:
+                self.handle_mode_switch(mode, force_clear=False)
+                return
+            
+            archive_name = os.path.basename(self.input_paths[0]).replace('.grn', '')
+            output_directory = os.path.join(output_dir_parent, f"decrypted_{archive_name}")
+            args = (mode, password, self.input_paths, level, output_directory, False, "")
+        else:
+            args = (mode, password, self.input_paths, level, None, shred, msg_content)
+            
+        thread = threading.Thread(target=self._process_threaded, args=args, daemon=True)
+        thread.start()
+
+    def _process_threaded(self, mode: str, password: str, paths: List[str], level: str, output_directory: Optional[str], shred: bool, secure_note: str):
+        try:
+            if mode == "Encrypt":
+                generator = self.crypto_service.encrypt_paths(password, paths, level, shred_source=shred, secure_note=secure_note)
+            else:
+                generator = self.crypto_service.decrypt_archive(password, paths[0], output_directory, level)
+
+            while True:
+                try:
+                    processed, total = next(generator)
+                    self.progress_queue.put((processed, total))
+                except StopIteration as e:
+                    result_path = e.value
+                    break
+                    
+            self.progress_queue.put(f"Success! Saved to {os.path.basename(result_path)}")
+            self.root.after(0, lambda rp=result_path: messagebox.showinfo("Complete", f"Operation successful!\nSaved to:\n{rp}"))
+            self.root.after(0, self.clear_fields)
+        except (InvalidTag, argon2.exceptions.VerifyMismatchError):
+            self.root.after(0, lambda: messagebox.showerror("Rejection", "Incorrect password or corrupt package structure detected."))
+        except PermissionError as pe:
+            self.root.after(0, lambda: messagebox.showerror("Boundary Catch", str(pe)))
+        except Exception as e:
+            err_msg = str(e)
+            self.root.after(0, lambda em=err_msg: messagebox.showerror("Error", f"An internal failure occurred:\n{em}"))
+        finally:
+            self.root.after(0, lambda: self.handle_mode_switch(self.mode_var.get(), force_clear=False))
+
+if __name__ == "__main__":
+    try:
+        root = TkinterDnD.Tk()
+        app = ModernEncryptionApp(root)
+        root.mainloop()
+    except Exception as e:
+        messagebox.showerror("System Error", f"Failed to initialize runtime: {e}")
